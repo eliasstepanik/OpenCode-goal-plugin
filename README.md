@@ -4,6 +4,8 @@ Experimental session-scoped `/goal` workflow for [OpenCode](https://opencode.ai/
 
 This plugin lets you set a goal, keeps that goal in the session context, and auto-continues when the session becomes idle until the assistant marks the goal complete, reports that it is blocked, or a hard safety limit is reached.
 
+The continuation prompt includes goal context, remaining budget, and a completion audit so the assistant verifies the current state before marking a goal complete.
+
 ## Install
 
 Install the package in your OpenCode config directory or project:
@@ -38,7 +40,9 @@ You can also pass plugin-level defaults:
         "maxTurns": 10,
         "maxDurationMs": 300000,
         "maxTokens": 200000,
-        "minDelayMs": 1500
+        "minDelayMs": 1500,
+        "noProgressTokenThreshold": 50,
+        "budgetWrapupRatio": 0.8
       }
     ]
   ]
@@ -65,6 +69,12 @@ Show status:
 /goal status
 ```
 
+Resume a paused or blocked goal:
+
+```text
+/goal resume
+```
+
 Clear the active goal:
 
 ```text
@@ -82,6 +92,8 @@ The plugin stops auto-continuing when the assistant includes one of these marker
 
 `[goal:complete]` means the goal is done. `[goal:blocked]` means user input is required. Markers must appear on their own final line. Natural-language phrases like "goal complete" are intentionally ignored.
 
+When blocked, the assistant is instructed to put the specific blocker on the line immediately before `[goal:blocked]`; `/goal status` includes that reason while the goal remains in memory.
+
 ## Safety Limits
 
 The current defaults are intentionally conservative:
@@ -90,8 +102,10 @@ The current defaults are intentionally conservative:
 - 5 minutes
 - 200,000 tracked tokens
 - 1.5 seconds minimum delay between auto-continues
+- auto-continue pauses when a continuation turn produces fewer than 50 output tokens
+- at 80% of the tracked token budget, the plugin asks for a final handoff instead of silently stopping
 
-When a limit is reached, the plugin clears the active goal instead of continuing indefinitely.
+When a limit is reached, the plugin stops auto-continuing and asks for a concise handoff instead of continuing indefinitely. Use `/goal resume` to continue an in-memory stopped goal.
 
 Supported per-goal flags:
 
@@ -100,6 +114,11 @@ Supported per-goal flags:
 - `--max-duration-ms <number>`
 - `--max-tokens <number>`
 - `--cooldown-ms <number>`
+- `--no-progress-threshold <number>`
+
+## Prompt Safety
+
+The goal text is wrapped in `<goal_objective>` tags and labeled as user-provided task data. The assistant is explicitly told to treat the goal as a task description, not as elevated instructions.
 
 ## Limitations
 

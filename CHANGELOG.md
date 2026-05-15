@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.3
+
+- Add structured continuation prompts with goal framing, budget context, and completion-audit instructions.
+- Wrap goal text as user-provided task data in `<goal_objective>` tags.
+- Use UUID goal IDs for stale-update protection.
+- Pause auto-continue after near-zero-output turns.
+- Add budget wrap-up prompts near the tracked token limit.
+- Store blocked reasons for `/goal status`.
+- Track `lastProgressAt` and no-progress turn count in status.
+- Add `/goal resume` for stopped in-memory goals.
+
 ## 0.1.2
 
 - Fix package entrypoints for OpenCode package resolution.
