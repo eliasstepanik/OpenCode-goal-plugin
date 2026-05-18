@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.6 — 2026-05-18
+
+- Add `/goal pause` plus clear aliases (`stop`, `off`, `reset`, `none`, `cancel`).
+- Preserve the last achieved goal in `/goal status` after `[goal:complete]`.
+- Make `/goal resume` restart the same objective with a fresh local budget after pause, blocker, no-progress pause, prompt failures, or limit stops.
+- Pause goals after repeated auto-continue prompt failures instead of retrying indefinitely.
+- Use OpenCode structured app logging when available, with console logging as a fallback.
+
 ## 0.1.5 — 2026-05-18
 
 - Change default `maxDurationMs` from 5 minutes to 15 minutes so the turn limit is the binding safety brake at typical LLM latency (30–90 s/turn).

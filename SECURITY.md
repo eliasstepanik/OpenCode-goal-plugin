@@ -6,7 +6,7 @@ This project is experimental. Security fixes are provided for the latest publish
 
 ## Reporting a Vulnerability
 
-Please report security issues privately by emailing the maintainer or using GitHub's private vulnerability reporting if it is enabled for the repository.
+Please report security issues through GitHub's private vulnerability reporting for this repository.
 
 Do not open a public issue for vulnerabilities that could expose user data, credentials, or local system access.
 
@@ -22,4 +22,3 @@ Relevant security-sensitive areas include:
 - leakage of goal text through logs or status output
 
 The goal text is wrapped in `<goal_objective>` tags and the closing tag is escaped before insertion. Other structural tags used in continuation prompts (`<goal_continuation>`, `<progress_budget>`, etc.) are not escaped. Crafted goal text containing those literal strings would close the tag early in the plaintext prompt; the model treats it as text rather than structure, so the practical risk for a local single-user tool is negligible.
-

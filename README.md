@@ -4,7 +4,7 @@ An experimental session-scoped `/goal` command for [OpenCode](https://opencode.a
 
 Set a goal and the plugin keeps it in context, auto-continues the session whenever the assistant goes idle, and stops when the goal is marked complete, a blocker is reported, or a safety limit is reached.
 
-Compatibility: tested against OpenCode 1.15.3. The plugin relies on experimental OpenCode hooks; pin or re-test against your OpenCode version before using it for unattended long-running work.
+Compatibility: tested against OpenCode 1.15.4. The plugin relies on experimental OpenCode hooks; pin or re-test against your OpenCode version before using it for unattended long-running work.
 
 ## Install
 
@@ -47,10 +47,16 @@ Check status:
 /goal status
 ```
 
-Resume a paused or blocked goal:
+Resume a paused or stopped goal:
 
 ```
 /goal resume
+```
+
+Pause without clearing the active goal:
+
+```
+/goal pause
 ```
 
 Clear the active goal:
@@ -58,6 +64,8 @@ Clear the active goal:
 ```
 /goal clear
 ```
+
+`/goal stop`, `/goal off`, `/goal reset`, `/goal none`, and `/goal cancel` are aliases for `/goal clear`.
 
 ## How it works
 
@@ -89,6 +97,7 @@ Markers must appear on their own final line. Natural-language phrases like "goal
 | Min delay between continues | 1.5 seconds |
 | No-progress pause | < 50 output tokens on a turn |
 | Budget wrap-up threshold | 80% of tracked token budget |
+| Auto-continue failure pause | 3 consecutive prompt failures |
 
 **Effective turn count.** Each LLM turn on a real task typically takes 30–90 seconds. At that latency, raising `--max-minutes` is usually more useful than raising `--max-turns`. At 45 s/turn, the default 15-minute window gives roughly 15–20 turns of headroom before the turn limit becomes the binding brake.
 
@@ -97,6 +106,8 @@ Markers must appear on their own final line. Natural-language phrases like "goal
 **Wrap-up vs. hard stop.** When a limit is reached, the plugin sends one final prompt asking the assistant to summarize what is done, what remains, and the next concrete step — rather than stopping silently. Use `/goal resume` to continue after any stop, including limit stops and no-progress pauses.
 
 Goal state is process-memory only. It is not persisted across OpenCode restarts, plugin reloads, or config reloads.
+
+`/goal resume` continues the same in-memory objective with a fresh local budget window. This lets you continue after pause, blocker, no-progress pause, rate-limit failures, or a limit stop without retyping the objective.
 
 ### Per-goal flags
 
@@ -126,7 +137,8 @@ Pass options when registering the plugin to change the defaults for all goals:
         "maxTokens": 200000,
         "minDelayMs": 1500,
         "noProgressTokenThreshold": 50,
-        "budgetWrapupRatio": 0.8
+        "budgetWrapupRatio": 0.8,
+        "maxPromptFailures": 3
       }
     ]
   ]
@@ -139,7 +151,7 @@ The goal text is wrapped in `<goal_objective>` tags and labeled as user-provided
 
 ## Limitations
 
-This is a marker-based implementation. The assistant is responsible for outputting `[goal:complete]` or `[goal:blocked]` — there is no independent evaluator verifying completion against the original goal. A future version could add a separate evaluator model once OpenCode exposes a clean plugin API for that flow.
+This is a marker-based implementation. The assistant is responsible for outputting `[goal:complete]` or `[goal:blocked]` — there is no independent evaluator verifying completion against the original goal. Claude Code's native `/goal` uses a separate evaluator model; this plugin currently approximates the workflow using OpenCode hooks and explicit completion markers. A future version could add a separate evaluator once OpenCode exposes a clean plugin API for that flow.
 
 OpenCode's current `command.execute.before` hook does not fully intercept command text. The plugin can update in-memory goal state as a side effect, but the goal text may still be routed into the normal assistant conversation alongside the state update.
 
@@ -163,7 +175,7 @@ Keep test files outside OpenCode's auto-loaded plugin directory — OpenCode wil
 2. Add a `goal` command with `"template": "$ARGUMENTS"`.
 3. Run `/goal status` — should report no active goal.
 4. Run `/goal inspect this repo and stop immediately with [goal:blocked] if you need user input`.
-5. Verify `/goal status`, `/goal resume`, and `/goal clear` behave as expected.
+5. Verify `/goal status`, `/goal pause`, `/goal resume`, and `/goal clear` behave as expected.
 
 ## Development
 

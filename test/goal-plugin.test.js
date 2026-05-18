@@ -33,7 +33,15 @@ function message(text, tokens = { input: 1, output: 100, reasoning: 0 }) {
 
 async function createHooks(overrides = {}) {
   const calls = []
+  const logs = []
   const client = {
+    app: {
+      log:
+        overrides.log ||
+        (async (input) => {
+          logs.push(input)
+        }),
+    },
     session: {
       messages: overrides.messages || (async () => ({ data: [message("still working")] })),
       promptAsync:
@@ -45,7 +53,7 @@ async function createHooks(overrides = {}) {
     },
   }
   const hooks = await GoalPlugin({ client }, overrides.options || {})
-  return { calls, hooks }
+  return { calls, hooks, logs }
 }
 
 test("exports v1 OpenCode plugin module shape", () => {
@@ -245,6 +253,88 @@ test("stopped goals can be resumed", async () => {
   const resumedOutput = { system: [] }
   await hooks["experimental.chat.system.transform"]({ sessionID: "session-1" }, resumedOutput)
   assert.equal(resumedOutput.system.length, 1)
+})
+
+test("resume after a limit stop starts a fresh local budget", async () => {
+  const { calls, hooks } = await createHooks({
+    options: { minDelayMs: 1, maxTurns: 1 },
+  })
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "ship it" },
+    { parts: [] },
+  )
+  await hooks.event({
+    event: {
+      type: "session.status",
+      properties: { sessionID: "session-1", status: { type: "idle" } },
+    },
+  })
+  await hooks.event({
+    event: {
+      type: "session.status",
+      properties: { sessionID: "session-1", status: { type: "idle" } },
+    },
+  })
+
+  const stoppedGoal = currentGoal("session-1")
+  assert.equal(stoppedGoal.stopped, true)
+  assert.match(stoppedGoal.stopReason, /max turns/)
+
+  const resumeOutput = { parts: [] }
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "resume" },
+    resumeOutput,
+  )
+  assert.match(resumeOutput.parts[0].text, /fresh limits/)
+  assert.equal(currentGoal("session-1").turnCount, 0)
+  assert.equal(currentGoal("session-1").stopped, false)
+
+  await hooks.event({
+    event: {
+      type: "session.status",
+      properties: { sessionID: "session-1", status: { type: "idle" } },
+    },
+  })
+  assert.equal(calls.length, 3)
+})
+
+test("/goal pause stops auto-continue until resumed", async () => {
+  const { calls, hooks } = await createHooks({ options: { minDelayMs: 1 } })
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "ship it" },
+    { parts: [] },
+  )
+
+  const pauseOutput = { parts: [] }
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "pause" },
+    pauseOutput,
+  )
+  assert.match(pauseOutput.parts[0].text, /Goal paused/)
+
+  await hooks.event({
+    event: {
+      type: "session.status",
+      properties: { sessionID: "session-1", status: { type: "idle" } },
+    },
+  })
+  assert.equal(calls.length, 0)
+})
+
+test("clear aliases remove active goals", async () => {
+  const { hooks } = await createHooks()
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "ship it" },
+    { parts: [] },
+  )
+
+  const output = { parts: [] }
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "cancel" },
+    output,
+  )
+  assert.match(output.parts[0].text, /Goal cleared/)
+  assert.equal(currentGoal("session-1"), null)
 })
 
 test("budget threshold sends wrap-up prompt and stops", async () => {
@@ -463,6 +553,35 @@ test("[goal:complete] removes goal from state", async () => {
     { command: "goal", sessionID: "session-1", arguments: "status" },
     statusOutput,
   )
+  assert.match(statusOutput.parts[0].text, /State: achieved/)
+  assert.match(statusOutput.parts[0].text, /Last goal: ship it/)
+})
+
+test("/goal clear removes completed goal status", async () => {
+  const { hooks } = await createHooks({
+    messages: async () => ({ data: [message("All done!\n\n[goal:complete]")] }),
+    options: { minDelayMs: 1 },
+  })
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "ship it" },
+    { parts: [] },
+  )
+  await hooks.event({
+    event: {
+      type: "session.status",
+      properties: { sessionID: "session-1", status: { type: "idle" } },
+    },
+  })
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "clear" },
+    { parts: [] },
+  )
+
+  const statusOutput = { parts: [] }
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "status" },
+    statusOutput,
+  )
   assert.match(statusOutput.parts[0].text, /No active goal/)
 })
 
@@ -484,6 +603,32 @@ test("promptAsync error response updates lastStatus without stopping the goal", 
   const goal = currentGoal("session-1")
   assert.match(goal.lastStatus, /Auto-continue failed: RateLimit/)
   assert.equal(goal.stopped, false)
+})
+
+test("repeated promptAsync errors pause the goal", async () => {
+  const { hooks } = await createHooks({
+    promptAsync: async () => ({ error: { name: "RateLimit" } }),
+    options: { minDelayMs: 1, maxPromptFailures: 2 },
+  })
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "ship it" },
+    { parts: [] },
+  )
+  await hooks.event({
+    event: {
+      type: "session.status",
+      properties: { sessionID: "session-1", status: { type: "idle" } },
+    },
+  })
+  await hooks.event({
+    event: {
+      type: "session.status",
+      properties: { sessionID: "session-1", status: { type: "idle" } },
+    },
+  })
+  const goal = currentGoal("session-1")
+  assert.equal(goal.stopped, true)
+  assert.equal(goal.stopReason, "auto-continue failures")
 })
 
 test("thrown error in event handler updates lastStatus and clears activeContinues", async () => {

@@ -10,12 +10,16 @@ const DEFAULT_OPTIONS = {
   warnTurnsRemaining: 3,
   warnDurationMsRemaining: 60 * 1000,
   warnTokensRemaining: 25000,
+  maxPromptFailures: 3,
 }
 
 const goalStates = new Map()
+const lastGoalResults = new Map()
 const seenTokens = new Map()
 const seenOutputTokens = new Map()
 const activeContinues = new Set()
+const CLEAR_COMMANDS = new Set(["clear", "stop", "off", "reset", "none", "cancel"])
+const PAUSE_COMMANDS = new Set(["pause"])
 
 function getText(parts) {
   return (parts || [])
@@ -60,6 +64,21 @@ function formatStatus(goal) {
   return lines.join("\n")
 }
 
+function formatGoalResult(result) {
+  const elapsed = Math.round((result.finishedAt - result.startedAt) / 1000)
+  const lines = [
+    `Last goal: ${result.condition}`,
+    `State: ${result.state}`,
+    `Auto-continues sent: ${result.turnCount}`,
+    `Tokens: ${result.totalTokens.toLocaleString()}`,
+    `Elapsed: ${elapsed}s`,
+    `Last status: ${result.lastStatus || "No status recorded."}`,
+  ]
+  if (result.reason) lines.push(`Reason: ${result.reason}`)
+  if (result.blockedReason) lines.push(`Blocked reason: ${result.blockedReason}`)
+  return lines.join("\n")
+}
+
 function goalIsComplete(text) {
   return /(^|\n)\s*\[goal:complete\]\s*$/i.test(text.trimEnd())
 }
@@ -87,6 +106,37 @@ function cleanupGoal(sessionID) {
   }
   goalStates.delete(sessionID)
   activeContinues.delete(sessionID)
+}
+
+function rememberGoalResult(sessionID, goal, state, reason = "") {
+  lastGoalResults.set(sessionID, {
+    condition: goal.condition,
+    state,
+    reason,
+    blockedReason: goal.blockedReason,
+    turnCount: goal.turnCount,
+    totalTokens: goal.totalTokens,
+    startedAt: goal.startedAt,
+    finishedAt: Date.now(),
+    lastStatus: goal.lastStatus,
+  })
+}
+
+function resetGoalBudget(goal) {
+  for (const messageID of goal.messageIDs) {
+    seenTokens.delete(messageID)
+    seenOutputTokens.delete(messageID)
+  }
+  goal.goalId = randomUUID()
+  goal.startedAt = Date.now()
+  goal.turnCount = 0
+  goal.totalTokens = 0
+  goal.lastContinueAt = 0
+  goal.lastProgressAt = 0
+  goal.noProgressTurns = 0
+  goal.budgetWrapupSent = false
+  goal.messageIDs = new Set()
+  goal.promptFailures = 0
 }
 
 function currentGoal(sessionID, goalID) {
@@ -127,7 +177,27 @@ function normalizeOptions(options = {}) {
       options.warnTokensRemaining,
       DEFAULT_OPTIONS.warnTokensRemaining,
     ),
+    maxPromptFailures: toPositiveInteger(
+      options.maxPromptFailures,
+      DEFAULT_OPTIONS.maxPromptFailures,
+    ),
   }
+}
+
+async function logPluginError(client, message, error) {
+  if (client?.app?.log) {
+    await client.app.log({
+      body: {
+        service: "opencode-goal-plugin",
+        level: "error",
+        message,
+        extra: { error: error?.message || error?.name || String(error) },
+      },
+    })
+    return
+  }
+
+  console.error("[goal-plugin]", message, error || "")
 }
 
 function parseGoalArguments(args, defaults) {
@@ -298,15 +368,36 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
 
       if (!args || args === "status") {
         const goal = goalStates.get(sessionID)
+        const lastResult = lastGoalResults.get(sessionID)
         output.parts = [
-          makeTextPart(goal ? formatStatus(goal) : "No active goal. Set one with `/goal <condition>`."),
+          makeTextPart(
+            goal
+              ? formatStatus(goal)
+              : lastResult
+                ? formatGoalResult(lastResult)
+                : "No active goal. Set one with `/goal <condition>`.",
+          ),
         ]
         return
       }
 
-      if (args === "clear") {
+      if (CLEAR_COMMANDS.has(args)) {
         cleanupGoal(sessionID)
+        lastGoalResults.delete(sessionID)
         output.parts = [makeTextPart("Goal cleared.")]
+        return
+      }
+
+      if (PAUSE_COMMANDS.has(args)) {
+        const goal = goalStates.get(sessionID)
+        if (!goal) {
+          output.parts = [makeTextPart("No active goal. Set one with `/goal <condition>`.")]
+          return
+        }
+        goal.stopped = true
+        goal.stopReason = "paused"
+        goal.lastStatus = "Goal paused."
+        output.parts = [makeTextPart(`Goal paused: ${goal.condition}`)]
         return
       }
 
@@ -321,13 +412,12 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
           return
         }
 
+        resetGoalBudget(goal)
         goal.stopped = false
         goal.stopReason = ""
         goal.blockedReason = ""
-        goal.noProgressTurns = 0
-        goal.lastContinueAt = 0
-        goal.lastStatus = "Goal resumed."
-        output.parts = [makeTextPart(`Goal resumed: ${goal.condition}`)]
+        goal.lastStatus = "Goal resumed with a fresh local budget."
+        output.parts = [makeTextPart(`Goal resumed with fresh limits: ${goal.condition}`)]
         return
       }
 
@@ -354,10 +444,12 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
         budgetWrapupSent: false,
         stopped: false,
         stopReason: "",
+        promptFailures: 0,
         messageIDs: new Set(),
       }
 
       cleanupGoal(sessionID)
+      lastGoalResults.delete(sessionID)
       goalStates.set(sessionID, goal)
       output.parts = [
         makeTextPart(
@@ -434,6 +526,8 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
         activeGoalAfterMessages.lastAssistantText = latestText
 
         if (goalIsComplete(latestText)) {
+          activeGoalAfterMessages.lastStatus = "Goal completed."
+          rememberGoalResult(sessionID, activeGoalAfterMessages, "achieved")
           cleanupGoal(sessionID)
           return
         }
@@ -515,15 +609,33 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
         if (response.error) {
           const activeGoalAfterPrompt = currentGoal(sessionID, goalID)
           const message = `Auto-continue failed: ${response.error.name || "unknown error"}`
-          if (activeGoalAfterPrompt) activeGoalAfterPrompt.lastStatus = message
-          console.error("[goal-plugin]", message, response.error)
+          if (activeGoalAfterPrompt) {
+            activeGoalAfterPrompt.promptFailures += 1
+            activeGoalAfterPrompt.lastStatus = message
+            if (activeGoalAfterPrompt.promptFailures >= activeGoalAfterPrompt.options.maxPromptFailures) {
+              activeGoalAfterPrompt.stopped = true
+              activeGoalAfterPrompt.stopReason = "auto-continue failures"
+              activeGoalAfterPrompt.lastStatus = `${message}; paused after ${activeGoalAfterPrompt.promptFailures} failure(s). Run /goal resume to retry.`
+            }
+          }
+          await logPluginError(client, message, response.error)
+        } else {
+          const activeGoalAfterPrompt = currentGoal(sessionID, goalID)
+          if (activeGoalAfterPrompt) activeGoalAfterPrompt.promptFailures = 0
         }
       } catch (error) {
         const activeGoalAfterError = currentGoal(sessionID, goalID)
         if (activeGoalAfterError) {
-          activeGoalAfterError.lastStatus = `Auto-continue failed: ${error?.message || error}`
+          activeGoalAfterError.promptFailures += 1
+          const message = `Auto-continue failed: ${error?.message || error}`
+          activeGoalAfterError.lastStatus = message
+          if (activeGoalAfterError.promptFailures >= activeGoalAfterError.options.maxPromptFailures) {
+            activeGoalAfterError.stopped = true
+            activeGoalAfterError.stopReason = "auto-continue failures"
+            activeGoalAfterError.lastStatus = `${message}; paused after ${activeGoalAfterError.promptFailures} failure(s). Run /goal resume to retry.`
+          }
         }
-        console.error("[goal-plugin]", error?.message || error)
+        await logPluginError(client, "Auto-continue failed", error)
       } finally {
         activeContinues.delete(sessionID)
       }
