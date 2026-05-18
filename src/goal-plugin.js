@@ -138,35 +138,30 @@ function parseGoalArguments(args, defaults) {
   for (let i = 0; i < parts.length; i += 1) {
     const part = parts[i]
     const next = parts[i + 1]
+    const nextIsValue = next !== undefined && !next.startsWith("--")
 
-    if (part === "--max-turns" && next) {
-      options.maxTurns = toPositiveInteger(next, options.maxTurns)
-      i += 1
+    if (part === "--max-turns") {
+      if (nextIsValue) { options.maxTurns = toPositiveInteger(next, options.maxTurns); i += 1 }
       continue
     }
-    if (part === "--max-duration-ms" && next) {
-      options.maxDurationMs = toPositiveInteger(next, options.maxDurationMs)
-      i += 1
+    if (part === "--max-duration-ms") {
+      if (nextIsValue) { options.maxDurationMs = toPositiveInteger(next, options.maxDurationMs); i += 1 }
       continue
     }
-    if (part === "--max-minutes" && next) {
-      options.maxDurationMs = toPositiveInteger(next, options.maxDurationMs / 60000) * 60000
-      i += 1
+    if (part === "--max-minutes") {
+      if (nextIsValue) { options.maxDurationMs = toPositiveInteger(next, options.maxDurationMs / 60000) * 60000; i += 1 }
       continue
     }
-    if (part === "--max-tokens" && next) {
-      options.maxTokens = toPositiveInteger(next, options.maxTokens)
-      i += 1
+    if (part === "--max-tokens") {
+      if (nextIsValue) { options.maxTokens = toPositiveInteger(next, options.maxTokens); i += 1 }
       continue
     }
-    if (part === "--cooldown-ms" && next) {
-      options.minDelayMs = toPositiveInteger(next, options.minDelayMs)
-      i += 1
+    if (part === "--cooldown-ms") {
+      if (nextIsValue) { options.minDelayMs = toPositiveInteger(next, options.minDelayMs); i += 1 }
       continue
     }
-    if (part === "--no-progress-threshold" && next) {
-      options.noProgressTokenThreshold = toPositiveInteger(next, options.noProgressTokenThreshold)
-      i += 1
+    if (part === "--no-progress-threshold") {
+      if (nextIsValue) { options.noProgressTokenThreshold = toPositiveInteger(next, options.noProgressTokenThreshold); i += 1 }
       continue
     }
 
@@ -319,6 +314,10 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
         const goal = goalStates.get(sessionID)
         if (!goal) {
           output.parts = [makeTextPart("No active goal. Set one with `/goal <condition>`.")]
+          return
+        }
+        if (!goal.stopped) {
+          output.parts = [makeTextPart("Goal is already running.")]
           return
         }
 
@@ -536,7 +535,7 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
       const goal = goalStates.get(input.sessionID)
       if (!goal) return
       if (goal.stopped) return
-      if (output.system.some((line) => line.includes("<goal_objective>"))) return
+      if (output.system.some((block) => block.includes("<goal_objective>"))) return
 
       output.system.push(
         [
@@ -545,7 +544,7 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
           "When fully satisfied, end the response with `[goal:complete]`.",
           "If user input is required, explain the blocker in the line immediately before `[goal:blocked]`.",
           buildLimitWarning(goal),
-        ].join("\n"),
+        ].filter(Boolean).join("\n"),
       )
     },
   }
@@ -573,7 +572,5 @@ export const testInternals = {
   normalizeOptions,
   outputTokensForMessage,
   parseGoalArguments,
-  seenOutputTokens,
-  seenTokens,
   stopReason,
 }
