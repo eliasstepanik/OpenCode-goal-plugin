@@ -1,4 +1,7 @@
 import assert from "node:assert/strict"
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import test from "node:test"
 import pluginModule, { GoalPlugin, testInternals } from "../src/goal-plugin.js"
 
@@ -52,7 +55,10 @@ async function createHooks(overrides = {}) {
         }),
     },
   }
-  const hooks = await GoalPlugin({ client }, overrides.options || {})
+  const hooks = await GoalPlugin(
+    { client },
+    { persistState: false, ...(overrides.options || {}) },
+  )
   return { calls, hooks, logs }
 }
 
@@ -74,7 +80,7 @@ test("completion markers must be final-line markers", () => {
 
 test("parses per-goal flags without including them in the condition", () => {
   const parsed = parseGoalArguments(
-    'fix tests --max-turns 20 --max-minutes 15 --max-tokens 400000 --cooldown-ms 25 --no-progress-threshold 12',
+    'fix tests --max-turns 20 --max-minutes 15 --max-tokens 400000 --cooldown-ms 25 --no-progress-threshold 12 --no-progress-turns 3',
     normalizeOptions(),
   )
   assert.equal(parsed.condition, "fix tests")
@@ -83,11 +89,12 @@ test("parses per-goal flags without including them in the condition", () => {
   assert.equal(parsed.options.maxTokens, 400000)
   assert.equal(parsed.options.minDelayMs, 25)
   assert.equal(parsed.options.noProgressTokenThreshold, 12)
+  assert.equal(parsed.options.noProgressTurnsBeforePause, 3)
 })
 
 test("supports equals-style per-goal flags", () => {
   const parsed = parseGoalArguments(
-    'fix tests --max-turns=20 --max-duration-ms=90000 --max-tokens=400000 --cooldown-ms=25 --no-progress-threshold=12',
+    'fix tests --max-turns=20 --max-duration-ms=90000 --max-tokens=400000 --cooldown-ms=25 --no-progress-threshold=12 --no-progress-turns=4',
     normalizeOptions(),
   )
   assert.equal(parsed.condition, "fix tests")
@@ -96,6 +103,7 @@ test("supports equals-style per-goal flags", () => {
   assert.equal(parsed.options.maxTokens, 400000)
   assert.equal(parsed.options.minDelayMs, 25)
   assert.equal(parsed.options.noProgressTokenThreshold, 12)
+  assert.equal(parsed.options.noProgressTurnsBeforePause, 4)
   assert.deepEqual(parsed.errors, [])
 })
 
@@ -225,10 +233,10 @@ test("clear during an in-flight idle handler prevents promptAsync", async () => 
   assert.equal(calls.length, 0)
 })
 
-test("near-zero output pauses instead of auto-continuing", async () => {
+test("near-zero repeated output pauses after the configured grace window", async () => {
   const { calls, hooks } = await createHooks({
     messages: async () => ({ data: [message("ok", { input: 1, output: 5, reasoning: 0 })] }),
-    options: { minDelayMs: 1, noProgressTokenThreshold: 50 },
+    options: { minDelayMs: 1, noProgressTokenThreshold: 50, noProgressTurnsBeforePause: 2 },
   })
   await hooks["command.execute.before"](
     { command: "goal", sessionID: "session-1", arguments: "ship it" },
@@ -246,8 +254,59 @@ test("near-zero output pauses instead of auto-continuing", async () => {
       properties: { sessionID: "session-1", status: { type: "idle" } },
     },
   })
+  await hooks.event({
+    event: {
+      type: "session.status",
+      properties: { sessionID: "session-1", status: { type: "idle" } },
+    },
+  })
 
-  assert.equal(calls.length, 1)
+  assert.equal(calls.length, 2)
+  assert.equal(currentGoal("session-1").stopped, true)
+  assert.equal(currentGoal("session-1").stopReason, "no progress")
+})
+
+test("short assistant updates that change content do not immediately count as stalled", async () => {
+  let callCount = 0
+  const { calls, hooks } = await createHooks({
+    messages: async () => {
+      callCount += 1
+      return {
+        data: [
+          {
+            info: {
+              id: `msg-${callCount}`,
+              role: "assistant",
+              sessionID: "session-changing",
+              tokens: { input: 1, output: 5, reasoning: 0 },
+            },
+            parts: [textPart(callCount === 1 ? "step one" : "step two")],
+          },
+        ],
+      }
+    },
+    options: { minDelayMs: 1, noProgressTokenThreshold: 50, noProgressTurnsBeforePause: 2 },
+  })
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-changing", arguments: "ship it" },
+    { parts: [] },
+  )
+  await hooks.event({
+    event: {
+      type: "session.status",
+      properties: { sessionID: "session-changing", status: { type: "idle" } },
+    },
+  })
+  await hooks.event({
+    event: {
+      type: "session.status",
+      properties: { sessionID: "session-changing", status: { type: "idle" } },
+    },
+  })
+
+  assert.equal(calls.length, 2)
+  assert.equal(currentGoal("session-changing").stopped, false)
+  assert.equal(currentGoal("session-changing").noProgressTurns, 0)
 })
 
 test("missing recent assistant message does not trigger a false no-progress stop", async () => {
@@ -263,7 +322,7 @@ test("missing recent assistant message does not trigger a false no-progress stop
       },
     },
   }
-  const hooks = await GoalPlugin({ client }, { minDelayMs: 1, noProgressTokenThreshold: 50 })
+  const hooks = await GoalPlugin({ client }, { persistState: false, minDelayMs: 1, noProgressTokenThreshold: 50 })
   await hooks["command.execute.before"](
     { command: "goal", sessionID: "session-1", arguments: "ship it" },
     { parts: [] },
@@ -298,7 +357,7 @@ test("maxRecentMessages is forwarded to the recent-message lookup", async () => 
         },
       },
     },
-    { minDelayMs: 1, maxRecentMessages: 37 },
+    { persistState: false, minDelayMs: 1, maxRecentMessages: 37 },
   )
 
   await hooks["command.execute.before"](
@@ -318,7 +377,7 @@ test("maxRecentMessages is forwarded to the recent-message lookup", async () => 
 test("stopped goals can be resumed", async () => {
   const { hooks } = await createHooks({
     messages: async () => ({ data: [message("ok", { input: 1, output: 5, reasoning: 0 })] }),
-    options: { minDelayMs: 1, noProgressTokenThreshold: 50 },
+    options: { minDelayMs: 1, noProgressTokenThreshold: 50, noProgressTurnsBeforePause: 1 },
   })
   await hooks["command.execute.before"](
     { command: "goal", sessionID: "session-1", arguments: "ship it" },
@@ -543,6 +602,7 @@ test("no-progress pause takes precedence over budget wrap-up threshold", async (
       maxTokens: 100,
       budgetWrapupRatio: 0.8,
       noProgressTokenThreshold: 50,
+      noProgressTurnsBeforePause: 1,
     },
   })
   await hooks["command.execute.before"](
@@ -650,9 +710,10 @@ test("formatStatus includes all key fields", () => {
     lastProgressAt: Date.now() - 5000,
     noProgressTurns: 0,
     lastStatus: "Continuing after assistant turn 3.",
-    stopped: false,
-    stopReason: "",
-    blockedReason: "",
+    stopped: true,
+    stopReason: "blocked",
+    blockedReason: "Need API key",
+    lastCheckpoint: { summary: "Inspected the repo and found the failing hook.", timestamp: Date.now() - 2000 },
   }
   const status = formatStatus(goal)
   assert.match(status, /Active goal: ship it/)
@@ -660,6 +721,175 @@ test("formatStatus includes all key fields", () => {
   assert.match(status, /Tokens:/)
   assert.match(status, /Elapsed:/)
   assert.match(status, /Last progress:/)
+  assert.match(status, /Recent checkpoint:/)
+  assert.match(status, /Blocked reason: Need API key/)
+  assert.match(status, /Suggested action: address the blocker, then run \/goal resume/)
+})
+
+test("/goal history shows lifecycle events and the latest checkpoint", async () => {
+  const { hooks } = await createHooks({
+    messages: async () => ({
+      data: [message("Inspected src/goal-plugin.js and prepared the next patch.", { input: 1, output: 80, reasoning: 0 })],
+    }),
+    options: { minDelayMs: 1 },
+  })
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-history", arguments: "ship it" },
+    { parts: [] },
+  )
+  await hooks.event({
+    event: {
+      type: "session.status",
+      properties: { sessionID: "session-history", status: { type: "idle" } },
+    },
+  })
+
+  const output = { parts: [] }
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-history", arguments: "history" },
+    output,
+  )
+
+  assert.match(output.parts[0].text, /Goal history for: ship it/)
+  assert.match(output.parts[0].text, /Latest checkpoint: Inspected src\/goal-plugin\.js and prepared the next patch\./)
+  assert.match(output.parts[0].text, /set:/)
+  assert.match(output.parts[0].text, /auto-continue:/)
+})
+
+test("persisted running goals are recovered in paused state after restart", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "goal-plugin-test-"))
+  const stateFilePath = join(dir, "state.json")
+
+  try {
+    const client = {
+      app: { log: async () => {} },
+      session: {
+        messages: async () => ({ data: [message("still working")] }),
+        promptAsync: async () => ({}),
+      },
+    }
+
+    const hooks = await GoalPlugin(
+      { client },
+      { persistState: true, stateFilePath, minDelayMs: 1 },
+    )
+    await hooks["command.execute.before"](
+      { command: "goal", sessionID: "session-persist", arguments: "ship it" },
+      { parts: [] },
+    )
+
+    const persisted = JSON.parse(await readFile(stateFilePath, "utf8"))
+    assert.equal(
+      persisted.goals.some(
+        (goal) => goal.sessionID === "session-persist" && goal.condition === "ship it",
+      ),
+      true,
+    )
+
+    const recoveredHooks = await GoalPlugin(
+      { client },
+      { persistState: true, stateFilePath, minDelayMs: 1 },
+    )
+    const recoveredGoal = currentGoal("session-persist")
+    assert.equal(recoveredGoal.stopped, true)
+    assert.equal(recoveredGoal.stopReason, "recovered after restart")
+
+    const statusOutput = { parts: [] }
+    await recoveredHooks["command.execute.before"](
+      { command: "goal", sessionID: "session-persist", arguments: "status" },
+      statusOutput,
+    )
+    assert.match(statusOutput.parts[0].text, /Recovered persisted goal state/)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("corrupt persisted state is preserved and not overwritten on startup", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "goal-plugin-test-"))
+  const stateFilePath = join(dir, "state.json")
+
+  try {
+    await writeFile(stateFilePath, "{not valid json", "utf8")
+    const client = {
+      app: { log: async () => {} },
+      session: {
+        messages: async () => ({ data: [] }),
+        promptAsync: async () => ({}),
+      },
+    }
+
+    await GoalPlugin({ client }, { persistState: true, stateFilePath, minDelayMs: 1 })
+
+    assert.equal(await readFile(stateFilePath, "utf8"), "{not valid json")
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("persisted state file is written with owner-only permissions", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "goal-plugin-test-"))
+  const stateFilePath = join(dir, "state.json")
+
+  try {
+    const client = {
+      app: { log: async () => {} },
+      session: {
+        messages: async () => ({ data: [] }),
+        promptAsync: async () => ({}),
+      },
+    }
+
+    const hooks = await GoalPlugin(
+      { client },
+      { persistState: true, stateFilePath, minDelayMs: 1 },
+    )
+    await hooks["command.execute.before"](
+      { command: "goal", sessionID: "session-perms", arguments: "ship it" },
+      { parts: [] },
+    )
+
+    const fileMode = (await stat(stateFilePath)).mode & 0o777
+    assert.equal(fileMode, 0o600)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("plugin reinitialization with a missing state file does not retain stale in-memory goals", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "goal-plugin-test-"))
+  const stateFilePath = join(dir, "state.json")
+  const missingStateFilePath = join(dir, "missing-state.json")
+
+  try {
+    const client = {
+      app: { log: async () => {} },
+      session: {
+        messages: async () => ({ data: [] }),
+        promptAsync: async () => ({}),
+      },
+    }
+
+    const hooks = await GoalPlugin(
+      { client },
+      { persistState: true, stateFilePath, minDelayMs: 1 },
+    )
+    await hooks["command.execute.before"](
+      { command: "goal", sessionID: "session-stale", arguments: "ship it" },
+      { parts: [] },
+    )
+    assert.notEqual(currentGoal("session-stale"), null)
+
+    await GoalPlugin(
+      { client },
+      { persistState: true, stateFilePath: missingStateFilePath, minDelayMs: 1 },
+    )
+
+    assert.equal(currentGoal("session-stale"), null)
+    assert.equal(JSON.parse(await readFile(missingStateFilePath, "utf8")).goals.length, 0)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
 })
 
 test("[goal:complete] removes goal from state", async () => {
@@ -921,7 +1151,7 @@ test("two sessions run independent goals without interference", async () => {
       },
     },
   }
-  const hooks = await GoalPlugin({ client }, { minDelayMs: 1 })
+  const hooks = await GoalPlugin({ client }, { persistState: false, minDelayMs: 1 })
 
   await hooks["command.execute.before"](
     { command: "goal", sessionID: "session-A", arguments: "task A" },

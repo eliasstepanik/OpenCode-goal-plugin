@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.9 — 2026-05-18
+
+- Persist active goals and recent results to `~/.opencode-goal-plugin/state.json` by default, with recovered goals loaded in a paused state.
+- Add `/goal history` plus richer `/goal status` output with recent checkpoint and suggested-next-action hints.
+- Replace one-shot low-output pausing with a configurable consecutive-stall grace window via `noProgressTurnsBeforePause` / `--no-progress-turns`.
+- Expand tests to cover history output, persistence recovery, repeated-stall pausing, and changing short assistant updates.
+
 ## 0.1.8 — 2026-05-18
 
 - Harden `--max-minutes` fallback arithmetic when mixed with millisecond duration overrides.

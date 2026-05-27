@@ -49,6 +49,12 @@ Check status:
 /goal status
 ```
 
+View lifecycle history and the latest checkpoint:
+
+```
+/goal history
+```
+
 Resume a paused or stopped goal:
 
 ```
@@ -97,7 +103,7 @@ Markers must appear on their own final line. The bracketed form is canonical, bu
 | Max duration | 15 minutes |
 | Tracked tokens | 200,000 |
 | Min delay between continues | 1.5 seconds |
-| No-progress pause | < 50 output tokens on a turn |
+| No-progress pause | < 50 output tokens on a stalled turn (after a 2-turn grace window) |
 | Budget wrap-up threshold | 80% of tracked token budget |
 | Auto-continue failure pause | 3 consecutive prompt failures |
 
@@ -105,11 +111,17 @@ Markers must appear on their own final line. The bracketed form is canonical, bu
 
 **Token budget.** The plugin tracks `input + output + reasoning` tokens across all session messages. In high-context sessions (large codebases, long conversation history), input overhead per turn can be substantial and the budget may be exhausted before the turn limit is reached. Treat it as a safety brake, not precise billing accounting.
 
+**No-progress heuristic.** A low-output turn does not pause immediately anymore. The plugin pauses only after `noProgressTurnsBeforePause` consecutive *stalled* low-output turns — repeated turns with very little output and no meaningful change in the latest assistant checkpoint.
+
 **Wrap-up vs. hard stop.** When a limit is reached, the plugin sends one final prompt asking the assistant to summarize what is done, what remains, and the next concrete step — rather than stopping silently. Use `/goal resume` to continue after any stop, including limit stops and no-progress pauses.
 
-Goal state is process-memory only. It is not persisted across OpenCode restarts, plugin reloads, or config reloads.
+Goal state is persisted by default to `~/.opencode-goal-plugin/state.json`, but only as a local workflow checkpoint. It is not synchronized across machines or OpenCode instances.
 
-`/goal resume` continues the same in-memory objective with a fresh local budget window. This lets you continue after pause, blocker, no-progress pause, rate-limit failures, or a limit stop without retyping the objective.
+The state directory is created with owner-only permissions, and the JSON state file is written as `0600` because it may contain goal text, assistant checkpoints, and workflow history.
+
+Recovered active goals are loaded in a **paused** state with a recovery note, so unattended auto-continue does not resume blindly after a restart. Set `"persistState": false` to keep purely in-memory behavior.
+
+`/goal resume` continues the same objective with a fresh local budget window. This lets you continue after pause, blocker, no-progress pause, rate-limit failures, or a limit stop without retyping the objective.
 
 ### Per-goal flags
 
@@ -123,12 +135,14 @@ Override any limit for a single goal:
 | `--max-tokens <n>` | Tracked token limit |
 | `--cooldown-ms <n>` | Minimum delay between continues |
 | `--no-progress-threshold <n>` | Output token floor before pausing |
+| `--no-progress-turns <n>` | Consecutive stalled low-output turns before pausing |
 
 Examples:
 
 ```sh
 /goal fix tests --max-turns 20 --max-tokens 400000
 /goal fix tests --max-turns=20 --max-tokens=400000
+/goal fix tests --no-progress-threshold 50 --no-progress-turns 2
 ```
 
 ### Plugin-level defaults
@@ -147,8 +161,11 @@ Pass options when registering the plugin to change the defaults for all goals. T
         "minDelayMs": 1500,
         "maxRecentMessages": 50,
         "noProgressTokenThreshold": 50,
+        "noProgressTurnsBeforePause": 2,
         "budgetWrapupRatio": 0.8,
         "maxPromptFailures": 3,
+        "persistState": true,
+        "stateFilePath": "/home/you/.opencode-goal-plugin/state.json",
         "resultRetentionMs": 604800000,
         "maxStoredResults": 200
       }
@@ -160,6 +177,9 @@ Pass options when registering the plugin to change the defaults for all goals. T
 Additional plugin-level options:
 
 - `maxRecentMessages` — how many recent session messages to scan when looking for the latest assistant turn before auto-continuing. Higher values make long, tool-heavy sessions less likely to lose the most recent assistant response.
+- `noProgressTurnsBeforePause` — grace window for low-output stalls. The plugin pauses only after this many consecutive stalled low-output turns rather than on the first one.
+- `persistState` — whether to persist active goals and recent goal results to disk.
+- `stateFilePath` — where the persisted state JSON is written. Useful if you want per-project or ephemeral storage.
 - `resultRetentionMs` — how long a completed goal summary remains available through `/goal status` after the goal leaves active memory.
 - `maxStoredResults` — maximum number of completed-goal summaries retained in process memory before the oldest ones are evicted.
 
