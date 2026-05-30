@@ -185,6 +185,39 @@ test("system transform is idempotent", async () => {
   assert.match(output.system[0], /<goal_objective>\nship it\n<\/goal_objective>/)
 })
 
+test("system transform merges into existing system block instead of adding a second one", async () => {
+  const { hooks } = await createHooks()
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "ship it" },
+    { parts: [] },
+  )
+
+  const basePrompt = "You are opencode, a coding assistant."
+  const output = { system: [basePrompt] }
+  await hooks["experimental.chat.system.transform"]({ sessionID: "session-1" }, output)
+
+  // Strict-template backends (e.g. Qwen on vLLM) reject any request with more
+  // than one role:"system" message. The goal block must be merged into the
+  // existing primary system entry, not pushed as a second array entry.
+  assert.equal(output.system.length, 1)
+  assert.ok(output.system[0].startsWith(basePrompt))
+  assert.match(output.system[0], /<goal_objective>\nship it\n<\/goal_objective>/)
+})
+
+test("system transform pushes a new block when system array is empty", async () => {
+  const { hooks } = await createHooks()
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-1", arguments: "ship it" },
+    { parts: [] },
+  )
+
+  const output = { system: [] }
+  await hooks["experimental.chat.system.transform"]({ sessionID: "session-1" }, output)
+
+  assert.equal(output.system.length, 1)
+  assert.match(output.system[0], /<goal_objective>\nship it\n<\/goal_objective>/)
+})
+
 test("session.status idle auto-continues once", async () => {
   const { calls, hooks } = await createHooks({ options: { minDelayMs: 1 } })
   await hooks["command.execute.before"](

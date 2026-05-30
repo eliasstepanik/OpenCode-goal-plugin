@@ -1059,15 +1059,19 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
       if (goal.stopped) return
       if (output.system.some((block) => block.includes("<goal_objective>"))) return
 
-      output.system.push(
-        [
-          buildGoalBlock(goal),
-          "Keep working until the goal is fully satisfied.",
-          "When fully satisfied, end the response with `[goal:complete]`.",
-          "If user input is required, explain the blocker in the line immediately before `[goal:blocked]`.",
-          buildLimitWarning(goal),
-        ].filter(Boolean).join("\n"),
-      )
+      const goalBlock = [
+        buildGoalBlock(goal),
+        "Keep working until the goal is fully satisfied.",
+        "When fully satisfied, end the response with `[goal:complete]`.",
+        "If user input is required, explain the blocker in the line immediately before `[goal:blocked]`.",
+        buildLimitWarning(goal),
+      ].filter(Boolean).join("\n")
+
+      if (output.system.length === 0) {
+        output.system.push(goalBlock)
+      } else {
+        output.system[0] = `${output.system[0]}\n\n${goalBlock}`
+      }
     },
   }
 }
