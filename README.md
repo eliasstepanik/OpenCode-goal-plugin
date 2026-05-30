@@ -4,7 +4,7 @@ An experimental session-scoped `/goal` command for [OpenCode](https://opencode.a
 
 Set a goal and the plugin keeps it in context, auto-continues the session whenever the assistant goes idle, and stops when the goal is marked complete, a blocker is reported, or a safety limit is reached.
 
-Compatibility: tested against OpenCode 1.15.4. The plugin relies on experimental OpenCode hooks; pin or re-test against your OpenCode version before using it for unattended long-running work.
+Compatibility: tested against OpenCode 1.15.11. The plugin relies on experimental OpenCode hooks; pin or re-test against your OpenCode version before using it for unattended long-running work.
 
 ## Install
 

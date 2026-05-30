@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.1.10 — 2026-05-30
+
 - Fix `experimental.chat.system.transform` to merge the goal continuation block into the primary system entry instead of pushing a separate one. Prevents `"System message must be at the beginning."` errors on strict-template backends (Qwen on vLLM, several Llama.cpp/Mistral templates). See issue #1.
 
 ## 0.1.9 — 2026-05-18
