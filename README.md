@@ -226,12 +226,6 @@ Keep test files outside OpenCode's auto-loaded plugin directory — OpenCode wil
 6. Verify `/goal status`, `/goal pause`, `/goal resume`, and `/goal clear` behave as expected.
 7. If you changed hook payload handling or command behavior, repeat the smoke test against the exact OpenCode version and provider/backend combination you care about.
 
-### Release checklist
-
-- Confirm `npm test`, `npm run test:coverage`, `npm run check`, `npm run smoke`, and `npm run pack:check` all pass.
-- Re-test against a real OpenCode install when touching command hooks, idle-event handling, or system-prompt transforms.
-- Update compatibility notes and changelog entries when behavior or tested surfaces change.
-
 ## Development
 
 ```sh
