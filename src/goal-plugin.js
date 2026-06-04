@@ -295,6 +295,11 @@ function parsePositiveIntegerStrict(value) {
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null
 }
 
+function toNonNegativeInteger(value, fallback = 0) {
+  const parsed = Number(value)
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : fallback
+}
+
 function stripWrappingQuotes(value) {
   return value.replace(/^["']|["']$/g, "")
 }
@@ -358,6 +363,109 @@ function normalizePersistenceOptions(options = {}) {
   }
 }
 
+function isPlainObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+}
+
+function normalizeTimestamp(value, fallback = Date.now()) {
+  const parsed = Number(value)
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback
+}
+
+function normalizeHistoryEntries(entries) {
+  if (!Array.isArray(entries)) return []
+  return entries
+    .filter(isPlainObject)
+    .map((entry) =>
+      makeHistoryEntry(
+        typeof entry.type === "string" && entry.type.trim() ? entry.type.trim() : "event",
+        typeof entry.detail === "string" ? entry.detail : "",
+        normalizeTimestamp(entry.timestamp),
+      ),
+    )
+}
+
+function normalizeCheckpointEntry(entry) {
+  if (!isPlainObject(entry)) return null
+  const summary = summarizeText(entry.summary)
+  if (!summary) return null
+  return {
+    summary,
+    timestamp: normalizeTimestamp(entry.timestamp),
+  }
+}
+
+function normalizeCheckpointEntries(entries) {
+  if (!Array.isArray(entries)) return []
+  return entries.map(normalizeCheckpointEntry).filter(Boolean)
+}
+
+function normalizePersistedGoal(rawGoal) {
+  if (!isPlainObject(rawGoal)) return null
+  if (typeof rawGoal.sessionID !== "string" || !rawGoal.sessionID.trim()) return null
+  if (typeof rawGoal.condition !== "string" || !rawGoal.condition.trim()) return null
+
+  const checkpoints = normalizeCheckpointEntries(rawGoal.checkpoints)
+  const lastCheckpoint = normalizeCheckpointEntry(rawGoal.lastCheckpoint) || checkpoints.at(-1) || null
+
+  return {
+    goalId:
+      typeof rawGoal.goalId === "string" && rawGoal.goalId.trim()
+        ? rawGoal.goalId
+        : randomUUID(),
+    condition: rawGoal.condition.trim(),
+    sessionID: rawGoal.sessionID.trim(),
+    turnCount: toNonNegativeInteger(rawGoal.turnCount),
+    startedAt: normalizeTimestamp(rawGoal.startedAt),
+    totalTokens: toNonNegativeInteger(rawGoal.totalTokens),
+    options: normalizeOptions(isPlainObject(rawGoal.options) ? rawGoal.options : {}),
+    lastStatus: typeof rawGoal.lastStatus === "string" ? rawGoal.lastStatus : "Goal recovered.",
+    lastAssistantText:
+      typeof rawGoal.lastAssistantText === "string" ? rawGoal.lastAssistantText : "",
+    lastAssistantMessageID:
+      typeof rawGoal.lastAssistantMessageID === "string" ? rawGoal.lastAssistantMessageID : "",
+    lastContinueAt: toNonNegativeInteger(rawGoal.lastContinueAt),
+    lastProgressAt: toNonNegativeInteger(rawGoal.lastProgressAt),
+    noProgressTurns: toNonNegativeInteger(rawGoal.noProgressTurns),
+    blockedReason: typeof rawGoal.blockedReason === "string" ? rawGoal.blockedReason : "",
+    budgetWrapupSent: rawGoal.budgetWrapupSent === true,
+    stopped: rawGoal.stopped === true,
+    stopReason: typeof rawGoal.stopReason === "string" ? rawGoal.stopReason : "",
+    promptFailures: toNonNegativeInteger(rawGoal.promptFailures),
+    messageIDs: Array.isArray(rawGoal.messageIDs)
+      ? rawGoal.messageIDs.filter((messageID) => typeof messageID === "string" && messageID)
+      : [],
+    history: normalizeHistoryEntries(rawGoal.history).slice(-MAX_HISTORY_ENTRIES),
+    checkpoints: checkpoints.slice(-MAX_CHECKPOINTS),
+    lastCheckpoint,
+  }
+}
+
+function normalizePersistedResult(rawResult) {
+  if (!isPlainObject(rawResult)) return null
+  if (typeof rawResult.sessionID !== "string" || !rawResult.sessionID.trim()) return null
+  if (typeof rawResult.condition !== "string" || !rawResult.condition.trim()) return null
+
+  const checkpoints = normalizeCheckpointEntries(rawResult.checkpoints)
+  const lastCheckpoint = normalizeCheckpointEntry(rawResult.lastCheckpoint) || checkpoints.at(-1) || null
+
+  return {
+    sessionID: rawResult.sessionID.trim(),
+    condition: rawResult.condition.trim(),
+    state: typeof rawResult.state === "string" && rawResult.state.trim() ? rawResult.state : "unknown",
+    reason: typeof rawResult.reason === "string" ? rawResult.reason : "",
+    blockedReason: typeof rawResult.blockedReason === "string" ? rawResult.blockedReason : "",
+    turnCount: toNonNegativeInteger(rawResult.turnCount),
+    totalTokens: toNonNegativeInteger(rawResult.totalTokens),
+    startedAt: normalizeTimestamp(rawResult.startedAt),
+    finishedAt: normalizeTimestamp(rawResult.finishedAt),
+    lastStatus: typeof rawResult.lastStatus === "string" ? rawResult.lastStatus : "",
+    lastCheckpoint,
+    checkpoints: checkpoints.slice(-MAX_CHECKPOINTS),
+    history: normalizeHistoryEntries(rawResult.history).slice(-MAX_HISTORY_ENTRIES),
+  }
+}
+
 function serializeGoal(goal) {
   return {
     ...goal,
@@ -405,13 +513,47 @@ async function loadPersistedState(persistenceOptions, client) {
       return "invalid"
     }
 
+    if (!Array.isArray(parsed.goals) || !Array.isArray(parsed.results)) {
+      await logPluginError(client, "Skipped persisted goal state: malformed goals/results arrays.")
+      return "invalid"
+    }
+
+    const loadedGoals = []
+    let skippedGoals = 0
+    for (const rawGoal of parsed.goals) {
+      const normalizedGoal = normalizePersistedGoal(rawGoal)
+      if (normalizedGoal) {
+        loadedGoals.push(normalizedGoal)
+      } else {
+        skippedGoals += 1
+      }
+    }
+
+    const loadedResults = []
+    let skippedResults = 0
+    for (const rawResult of parsed.results) {
+      const normalizedResult = normalizePersistedResult(rawResult)
+      if (normalizedResult) {
+        loadedResults.push(normalizedResult)
+      } else {
+        skippedResults += 1
+      }
+    }
+
+    if (skippedGoals > 0 || skippedResults > 0) {
+      await logPluginError(
+        client,
+        `Skipped invalid persisted entries: ${skippedGoals} goal(s), ${skippedResults} result(s).`,
+      )
+    }
+
     clearRuntimeState()
 
-    for (const goal of parsed.goals || []) {
+    for (const goal of loadedGoals) {
       goalStates.set(goal.sessionID, deserializeGoal(goal))
     }
 
-    for (const result of parsed.results || []) {
+    for (const result of loadedResults) {
       lastGoalResults.set(result.sessionID, result)
     }
 
@@ -634,12 +776,104 @@ function formatArgumentErrors(errors) {
   ].join("\n")
 }
 
+function messageRole(message) {
+  return message?.info?.role || message?.role || ""
+}
+
+function messageID(message) {
+  return message?.info?.id || message?.id || ""
+}
+
+function messageSessionID(message) {
+  return message?.info?.sessionID || message?.sessionID || ""
+}
+
+function messageTokens(message) {
+  return isPlainObject(message?.info?.tokens)
+    ? message.info.tokens
+    : isPlainObject(message?.tokens)
+      ? message.tokens
+      : {}
+}
+
+function totalTokensForMessage(message) {
+  const tokens = messageTokens(message)
+  return (
+    toNonNegativeInteger(tokens.input) +
+    toNonNegativeInteger(tokens.output) +
+    toNonNegativeInteger(tokens.reasoning)
+  )
+}
+
+function messageInfoFromEvent(event) {
+  const candidates = [
+    event?.properties?.info,
+    event?.properties?.message?.info,
+    event?.properties?.message,
+  ]
+  return candidates.find(isPlainObject) || null
+}
+
+function appendGoalToSystemBlock(block, goalBlock) {
+  if (typeof block === "string") {
+    return `${block}\n\n${goalBlock}`
+  }
+
+  if (!isPlainObject(block)) return null
+
+  if (typeof block.text === "string") {
+    return {
+      ...block,
+      text: `${block.text}\n\n${goalBlock}`,
+    }
+  }
+
+  if (typeof block.content === "string") {
+    return {
+      ...block,
+      content: `${block.content}\n\n${goalBlock}`,
+    }
+  }
+
+  if (Array.isArray(block.content)) {
+    const content = [...block.content]
+    const firstTextIndex = content.findIndex(
+      (part) => isPlainObject(part) && typeof part.text === "string",
+    )
+    if (firstTextIndex >= 0) {
+      content[firstTextIndex] = {
+        ...content[firstTextIndex],
+        text: `${content[firstTextIndex].text}\n\n${goalBlock}`,
+      }
+      return {
+        ...block,
+        content,
+      }
+    }
+  }
+
+  return null
+}
+
+function systemBlockContainsGoal(block) {
+  if (typeof block === "string") return block.includes("<goal_objective>")
+  if (!isPlainObject(block)) return false
+  if (typeof block.text === "string") return block.text.includes("<goal_objective>")
+  if (typeof block.content === "string") return block.content.includes("<goal_objective>")
+  if (Array.isArray(block.content)) {
+    return block.content.some(
+      (part) => isPlainObject(part) && typeof part.text === "string" && part.text.includes("<goal_objective>"),
+    )
+  }
+  return false
+}
+
 function findLatestAssistantMessage(messages) {
-  return [...(messages || [])].reverse().find((message) => message.info?.role === "assistant") || null
+  return [...(messages || [])].reverse().find((message) => messageRole(message) === "assistant") || null
 }
 
 function outputTokensForMessage(message) {
-  return message?.info?.tokens?.output || 0
+  return toNonNegativeInteger(messageTokens(message).output)
 }
 
 function budgetWrapupNeeded(goal) {
@@ -821,34 +1055,34 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
 
     event: async ({ event }) => {
       if (event.type === "message.updated") {
-        const message = event.properties?.info
+        const message = messageInfoFromEvent(event)
         if (!message) return
 
-        const goal = goalStates.get(message.sessionID)
+        const goal = goalStates.get(messageSessionID(message))
         if (!goal) return
 
+        const currentMessageID = messageID(message)
+        if (!currentMessageID) return
+
         let changed = false
-        const currentOutputTokens = message.tokens?.output || 0
-        const previousOutputTokens = seenOutputTokens.get(message.id) || 0
-        const currentTokens =
-          (message.tokens?.input || 0) +
-          currentOutputTokens +
-          (message.tokens?.reasoning || 0)
-        const previousTokens = seenTokens.get(message.id) || 0
+        const currentOutputTokens = outputTokensForMessage(message)
+        const previousOutputTokens = seenOutputTokens.get(currentMessageID) || 0
+        const currentTokens = totalTokensForMessage(message)
+        const previousTokens = seenTokens.get(currentMessageID) || 0
         if (currentTokens > previousTokens) {
           goal.totalTokens += currentTokens - previousTokens
-          seenTokens.set(message.id, currentTokens)
-          goal.messageIDs.add(message.id)
+          seenTokens.set(currentMessageID, currentTokens)
+          goal.messageIDs.add(currentMessageID)
           changed = true
         }
 
         if (currentOutputTokens > previousOutputTokens) {
-          seenOutputTokens.set(message.id, currentOutputTokens)
-          goal.messageIDs.add(message.id)
+          seenOutputTokens.set(currentMessageID, currentOutputTokens)
+          goal.messageIDs.add(currentMessageID)
           changed = true
         }
 
-        if (message.role === "assistant" && currentOutputTokens > previousOutputTokens) {
+        if (messageRole(message) === "assistant" && currentOutputTokens > previousOutputTokens) {
           goal.lastProgressAt = Date.now()
           changed = true
         }
@@ -1057,7 +1291,8 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
       const goal = goalStates.get(input.sessionID)
       if (!goal) return
       if (goal.stopped) return
-      if (output.system.some((block) => block.includes("<goal_objective>"))) return
+      const systemBlocks = Array.isArray(output.system) ? [...output.system] : []
+      if (systemBlocks.some(systemBlockContainsGoal)) return
 
       const goalBlock = [
         buildGoalBlock(goal),
@@ -1067,11 +1302,18 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
         buildLimitWarning(goal),
       ].filter(Boolean).join("\n")
 
-      if (output.system.length === 0) {
-        output.system.push(goalBlock)
-      } else {
-        output.system[0] = `${output.system[0]}\n\n${goalBlock}`
+      if (systemBlocks.length === 0) {
+        output.system = [goalBlock]
+        return
       }
+
+      const mergedFirstBlock = appendGoalToSystemBlock(systemBlocks[0], goalBlock)
+      if (mergedFirstBlock) {
+        systemBlocks[0] = mergedFirstBlock
+      } else {
+        systemBlocks.unshift(goalBlock)
+      }
+      output.system = systemBlocks
     },
   }
 }

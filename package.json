@@ -10,16 +10,19 @@
   },
   "files": [
     "src",
+    "scripts",
     "examples",
     "README.md",
     "CHANGELOG.md",
     "CONTRIBUTING.md",
     "SECURITY.md",
-    "LICENSE"
+    "LICENSE",
+    ".nvmrc"
   ],
   "scripts": {
     "test": "node --test",
     "test:coverage": "node --test --experimental-test-coverage",
+    "smoke": "node scripts/smoke-command-hook.mjs",
     "check": "node -c src/goal-plugin.js && npm test",
     "pack:check": "npm pack --dry-run"
   },

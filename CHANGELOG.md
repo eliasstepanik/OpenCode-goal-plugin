@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Add `npm run smoke`, a package-export smoke test that exercises the `/goal` command hook without invoking a model.
+- Run CI across Node 18, 20, and 22, and wire the package-entry smoke test into the workflow.
+- Harden persisted-state loading with schema validation and explicit skipping of malformed goal/result entries.
+- Make hook handling more defensive around message payload shapes and `system` block normalization.
+- Expand docs around compatibility, release checks, smoke testing, and security reporting fallback.
+
 ## 0.1.10 — 2026-05-30
 
 - Fix `experimental.chat.system.transform` to merge the goal continuation block into the primary system entry instead of pushing a separate one. Prevents `"System message must be at the beginning."` errors on strict-template backends (Qwen on vLLM, several Llama.cpp/Mistral templates). See issue #1.

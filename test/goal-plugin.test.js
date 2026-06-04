@@ -8,6 +8,7 @@ import pluginModule, { GoalPlugin, testInternals } from "../src/goal-plugin.js"
 const {
   buildContinueMessage,
   buildGoalBlock,
+  buildLimitWarning,
   currentGoal,
   extractBlockedReason,
   formatStatus,
@@ -1213,4 +1214,354 @@ test("two sessions run independent goals without interference", async () => {
   assert.equal(calls[1].path.id, "session-B")
   assert.equal(currentGoal("session-A").condition, "task A")
   assert.equal(currentGoal("session-B").condition, "task B")
+})
+
+test("buildLimitWarning reports remaining seconds when duration is nearly exhausted", () => {
+  const warning = buildLimitWarning({
+    turnCount: 0,
+    totalTokens: 0,
+    startedAt: Date.now() - 59_500,
+    options: normalizeOptions({
+      maxTurns: 10,
+      maxTokens: 200_000,
+      maxDurationMs: 60_000,
+      warnDurationMsRemaining: 60_000,
+    }),
+  })
+
+  assert.match(warning, /s remaining/)
+})
+
+test("duration limit requests a final handoff and stops the goal", async () => {
+  const { calls, hooks } = await createHooks({
+    options: { minDelayMs: 1, maxDurationMs: 10_000, noProgressTokenThreshold: 1 },
+  })
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-duration", arguments: "ship it" },
+    { parts: [] },
+  )
+
+  const goal = currentGoal("session-duration")
+  goal.startedAt = Date.now() - 11_000
+
+  await hooks.event({
+    event: {
+      type: "session.status",
+      properties: { sessionID: "session-duration", status: { type: "idle" } },
+    },
+  })
+
+  assert.equal(calls.length, 1)
+  assert.match(calls[0].body.parts[0].text, /<budget_wrapup>/)
+  assert.equal(goal.stopped, true)
+  assert.match(goal.stopReason, /max duration reached/)
+})
+
+test("system transform tolerates missing and structured system blocks", async () => {
+  const { hooks } = await createHooks()
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-system-shape", arguments: "ship it" },
+    { parts: [] },
+  )
+
+  const output = {}
+  await hooks["experimental.chat.system.transform"]({ sessionID: "session-system-shape" }, output)
+  assert.equal(Array.isArray(output.system), true)
+  assert.equal(output.system.length, 1)
+  assert.match(output.system[0], /<goal_objective>\nship it\n<\/goal_objective>/)
+
+  const outputWithObject = { system: [{ role: "system", text: "base system" }] }
+  await hooks["experimental.chat.system.transform"]({ sessionID: "session-system-shape" }, outputWithObject)
+  assert.equal(outputWithObject.system.length, 1)
+  assert.equal(outputWithObject.system[0].role, "system")
+  assert.match(outputWithObject.system[0].text, /base system/)
+  assert.match(outputWithObject.system[0].text, /<goal_objective>/)
+
+  const outputWithOpaqueObject = { system: [{ role: "system", metadata: true }] }
+  await hooks["experimental.chat.system.transform"](
+    { sessionID: "session-system-shape" },
+    outputWithOpaqueObject,
+  )
+  assert.equal(outputWithOpaqueObject.system.length, 2)
+  assert.match(outputWithOpaqueObject.system[0], /<goal_objective>/)
+  assert.deepEqual(outputWithOpaqueObject.system[1], { role: "system", metadata: true })
+})
+
+test("message.updated accepts nested message payload shapes", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "goal-plugin-test-"))
+  const stateFilePath = join(dir, "state.json")
+
+  try {
+    const hooks = await GoalPlugin(
+      {
+        client: {
+          app: { log: async () => {} },
+          session: {
+            messages: async () => ({ data: [] }),
+            promptAsync: async () => ({}),
+          },
+        },
+      },
+      { persistState: true, stateFilePath, minDelayMs: 1 },
+    )
+
+    await hooks["command.execute.before"](
+      { command: "goal", sessionID: "session-nested-message", arguments: "ship it" },
+      { parts: [] },
+    )
+
+    await hooks.event({
+      event: {
+        type: "message.updated",
+        properties: {
+          message: {
+            info: {
+              id: "msg-nested",
+              role: "assistant",
+              sessionID: "session-nested-message",
+              tokens: { input: 4, output: 7, reasoning: 3 },
+            },
+          },
+        },
+      },
+    })
+
+    const goal = currentGoal("session-nested-message")
+    assert.equal(goal.totalTokens, 14)
+    assert.ok(goal.messageIDs.has("msg-nested"))
+    assert.ok(goal.lastProgressAt > 0)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("unsupported persisted state version is ignored without clearing runtime state", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "goal-plugin-test-"))
+  const stateFilePath = join(dir, "state.json")
+
+  try {
+    await writeFile(
+      stateFilePath,
+      JSON.stringify({ version: 999, goals: [{ sessionID: "bad", condition: "bad" }], results: [] }),
+      "utf8",
+    )
+
+    await GoalPlugin(
+      {
+        client: {
+          app: { log: async () => {} },
+          session: { messages: async () => ({ data: [] }), promptAsync: async () => ({}) },
+        },
+      },
+      { persistState: true, stateFilePath, minDelayMs: 1 },
+    )
+
+    assert.equal(currentGoal("bad"), null)
+    assert.equal(JSON.parse(await readFile(stateFilePath, "utf8")).version, 999)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("malformed persisted arrays are ignored and not overwritten on startup", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "goal-plugin-test-"))
+  const stateFilePath = join(dir, "state.json")
+
+  try {
+    await writeFile(stateFilePath, JSON.stringify({ version: 1, goals: {}, results: [] }), "utf8")
+
+    await GoalPlugin(
+      {
+        client: {
+          app: { log: async () => {} },
+          session: { messages: async () => ({ data: [] }), promptAsync: async () => ({}) },
+        },
+      },
+      { persistState: true, stateFilePath, minDelayMs: 1 },
+    )
+
+    assert.equal(JSON.parse(await readFile(stateFilePath, "utf8")).goals.constructor, Object)
+    assert.equal(currentGoal("anything"), null)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("persisted state skips malformed entries while keeping valid ones", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "goal-plugin-test-"))
+  const stateFilePath = join(dir, "state.json")
+
+  try {
+    await writeFile(
+      stateFilePath,
+      JSON.stringify({
+        version: 1,
+        goals: [
+          {
+            sessionID: "session-valid-goal",
+            condition: "valid goal",
+            startedAt: Date.now(),
+            options: { maxTurns: 7 },
+            history: [{ type: "set", detail: "Goal created.", timestamp: Date.now() }],
+            checkpoints: [{ summary: "Checked the repo.", timestamp: Date.now() }],
+          },
+          { sessionID: "", condition: "invalid goal" },
+        ],
+        results: [
+          {
+            sessionID: "session-valid-result",
+            condition: "valid result",
+            state: "achieved",
+            startedAt: Date.now() - 1000,
+            finishedAt: Date.now(),
+            history: [{ type: "completed", detail: "Wrapped up.", timestamp: Date.now() }],
+          },
+          { sessionID: "session-bad-result" },
+        ],
+      }),
+      "utf8",
+    )
+
+    const hooks = await GoalPlugin(
+      {
+        client: {
+          app: { log: async () => {} },
+          session: { messages: async () => ({ data: [] }), promptAsync: async () => ({}) },
+        },
+      },
+      { persistState: true, stateFilePath, minDelayMs: 1 },
+    )
+
+    const loadedGoal = currentGoal("session-valid-goal")
+    assert.equal(loadedGoal.condition, "valid goal")
+    assert.equal(loadedGoal.options.maxTurns, 7)
+    assert.equal(currentGoal("") , null)
+
+    const statusOutput = { parts: [] }
+    await hooks["command.execute.before"](
+      { command: "goal", sessionID: "session-valid-result", arguments: "status" },
+      statusOutput,
+    )
+    assert.match(statusOutput.parts[0].text, /Last goal: valid result/)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("/goal history returns the most recent completed goal history", async () => {
+  const { hooks } = await createHooks({
+    messages: async () => ({ data: [message("Done after inspecting src/goal-plugin.js\n\n[goal:complete]")] }),
+    options: { minDelayMs: 1 },
+  })
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-completed-history", arguments: "ship it" },
+    { parts: [] },
+  )
+  await hooks.event({
+    event: {
+      type: "session.status",
+      properties: { sessionID: "session-completed-history", status: { type: "idle" } },
+    },
+  })
+
+  const output = { parts: [] }
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-completed-history", arguments: "history" },
+    output,
+  )
+
+  assert.match(output.parts[0].text, /Last goal history for: ship it/)
+  assert.match(output.parts[0].text, /completed:/)
+})
+
+test("repeated thrown event-handler errors eventually pause the goal", async () => {
+  const { hooks } = await createHooks({
+    messages: async () => {
+      throw new Error("network")
+    },
+    options: { minDelayMs: 1, maxPromptFailures: 2 },
+  })
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-thrown-failures", arguments: "ship it" },
+    { parts: [] },
+  )
+
+  await hooks.event({
+    event: {
+      type: "session.status",
+      properties: { sessionID: "session-thrown-failures", status: { type: "idle" } },
+    },
+  })
+  await hooks.event({
+    event: {
+      type: "session.status",
+      properties: { sessionID: "session-thrown-failures", status: { type: "idle" } },
+    },
+  })
+
+  const goal = currentGoal("session-thrown-failures")
+  assert.equal(goal.stopped, true)
+  assert.equal(goal.stopReason, "auto-continue failures")
+})
+
+test("missing client.app.log falls back to console.error", async () => {
+  const originalConsoleError = console.error
+  const captured = []
+  console.error = (...args) => {
+    captured.push(args)
+  }
+
+  try {
+    const hooks = await GoalPlugin(
+      {
+        client: {
+          session: {
+            messages: async () => {
+              throw new Error("network")
+            },
+            promptAsync: async () => ({}),
+          },
+        },
+      },
+      { persistState: false, minDelayMs: 1 },
+    )
+    await hooks["command.execute.before"](
+      { command: "goal", sessionID: "session-console-fallback", arguments: "ship it" },
+      { parts: [] },
+    )
+    await hooks.event({
+      event: {
+        type: "session.status",
+        properties: { sessionID: "session-console-fallback", status: { type: "idle" } },
+      },
+    })
+
+    assert.ok(captured.length >= 1)
+    assert.match(String(captured.at(-1)[1]), /Auto-continue failed/)
+  } finally {
+    console.error = originalConsoleError
+  }
+})
+
+test("persist failures are logged without throwing", async () => {
+  const logs = []
+  const hooks = await GoalPlugin(
+    {
+      client: {
+        app: { log: async (input) => logs.push(input) },
+        session: {
+          messages: async () => ({ data: [] }),
+          promptAsync: async () => ({}),
+        },
+      },
+    },
+    { persistState: true, stateFilePath: "/dev/null/state.json", minDelayMs: 1 },
+  )
+
+  await hooks["command.execute.before"](
+    { command: "goal", sessionID: "session-persist-failure", arguments: "ship it" },
+    { parts: [] },
+  )
+
+  assert.ok(logs.some((entry) => entry.body.message === "Failed to persist goal state"))
 })
