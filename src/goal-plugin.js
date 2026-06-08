@@ -255,6 +255,7 @@ function rememberGoalResult(sessionID, goal, state, reason = "") {
     lastCheckpoint: goal.lastCheckpoint || null,
     checkpoints: [...(goal.checkpoints || [])],
     history: [...(goal.history || [])],
+    trackedActions: normalizeTrackedActions(goal.trackedActions),
   })
   pruneGoalResults(goal.options)
 }
@@ -400,6 +401,57 @@ function normalizeCheckpointEntries(entries) {
   return entries.map(normalizeCheckpointEntry).filter(Boolean)
 }
 
+const MAX_TRACKED_ACTIONS = 50
+const MAX_TRACKED_ACTION_ARG_CHARS = 1200
+const MAX_TRACKED_ACTION_ERROR_CHARS = 800
+
+function normalizeTrackedAction(action) {
+  if (!isPlainObject(action)) return null
+
+  const toolName =
+    typeof action.toolName === "string" && action.toolName.trim()
+      ? action.toolName.trim()
+      : "unknown"
+
+  return {
+    toolName,
+    args:
+      typeof action.args === "string"
+        ? summarizeText(action.args, MAX_TRACKED_ACTION_ARG_CHARS)
+        : summarizeText(JSON.stringify(action.args ?? null), MAX_TRACKED_ACTION_ARG_CHARS),
+    timestamp: normalizeTimestamp(action.timestamp),
+    status:
+      action.status === "error" || action.status === "success"
+        ? action.status
+        : "unknown",
+    error:
+      typeof action.error === "string"
+        ? summarizeText(action.error, MAX_TRACKED_ACTION_ERROR_CHARS)
+        : "",
+  }
+}
+
+function normalizeTrackedActions(actions) {
+  if (!Array.isArray(actions)) return []
+  return actions.map(normalizeTrackedAction).filter(Boolean).slice(-MAX_TRACKED_ACTIONS)
+}
+
+function extractToolError(output) {
+  const metadata = output?.metadata
+  const msg = metadata?.error || ""
+  if (msg) return summarizeText(msg, MAX_TRACKED_ACTION_ERROR_CHARS)
+  if (metadata?.exitCode && metadata.exitCode !== 0) {
+    const out = output?.output || ""
+    return summarizeText(out || `exit ${metadata.exitCode}`, MAX_TRACKED_ACTION_ERROR_CHARS)
+  }
+  return ""
+}
+
+function summarizeToolArgs(args) {
+  if (!args) return ""
+  return summarizeText(JSON.stringify(args), MAX_TRACKED_ACTION_ARG_CHARS)
+}
+
 function normalizePersistedGoal(rawGoal) {
   if (!isPlainObject(rawGoal)) return null
   if (typeof rawGoal.sessionID !== "string" || !rawGoal.sessionID.trim()) return null
@@ -438,6 +490,8 @@ function normalizePersistedGoal(rawGoal) {
     history: normalizeHistoryEntries(rawGoal.history).slice(-MAX_HISTORY_ENTRIES),
     checkpoints: checkpoints.slice(-MAX_CHECKPOINTS),
     lastCheckpoint,
+    trackedActions: normalizeTrackedActions(rawGoal.trackedActions),
+    completionVerificationPrompted: rawGoal.completionVerificationPrompted === true,
   }
 }
 
@@ -473,6 +527,8 @@ function serializeGoal(goal) {
     history: [...(goal.history || [])],
     checkpoints: [...(goal.checkpoints || [])],
     lastCheckpoint: goal.lastCheckpoint || null,
+    trackedActions: normalizeTrackedActions(goal.trackedActions),
+    completionVerificationPrompted: goal.completionVerificationPrompted === true,
   }
 }
 
@@ -483,6 +539,8 @@ function deserializeGoal(goal) {
     history: Array.isArray(goal?.history) ? goal.history : [],
     checkpoints: Array.isArray(goal?.checkpoints) ? goal.checkpoints : [],
     lastCheckpoint: goal?.lastCheckpoint || null,
+    trackedActions: normalizeTrackedActions(goal?.trackedActions),
+    completionVerificationPrompted: goal?.completionVerificationPrompted === true,
   }
 
   if (!hydrated.stopped) {
@@ -714,6 +772,10 @@ function buildContinueMessage(goal, { budgetWrapup = false } = {}) {
     `elapsed_seconds: ${elapsedSeconds}`,
     "</progress_budget>",
     "",
+    "<recent_actions>",
+    formatTrackedActions(goal.trackedActions),
+    "</recent_actions>",
+    "",
   ]
 
   if (budgetWrapup) {
@@ -764,6 +826,19 @@ function extractBlockedReason(text) {
     .slice(0, markerIndex)
     .reverse()
     .find((line) => line.trim())?.trim() || ""
+}
+
+function formatTrackedActions(actions = [], limit = 8) {
+  const recent = actions.slice(-limit)
+  if (!recent.length) return "No tracked tool actions yet."
+  return recent
+    .map((a) => {
+      const status = a.status || "unknown"
+      const age = formatAge(a.timestamp)
+      const error = a.error ? ` error=${summarizeText(a.error, 120)}` : ""
+      return `- ${a.toolName} status=${status} at=${formatTimestamp(a.timestamp)} (${age})${error}`
+    })
+    .join("\n")
 }
 
 function formatArgumentErrors(errors) {
@@ -887,6 +962,7 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
   const defaultGoalOptions = normalizeOptions(pluginOptions)
   const persistenceOptions = normalizePersistenceOptions(pluginOptions)
   const persist = async () => persistState(persistenceOptions, client)
+  const commandResponseTexts = new Set()
 
   clearRuntimeState()
   const persistedStateStatus = await loadPersistedState(persistenceOptions, client)
@@ -894,6 +970,7 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
   if (persistedStateStatus === "loaded" || persistedStateStatus === "missing") {
     await persist()
   }
+  console.info("[goal-plugin]", `Initialized. Persisted state: ${persistedStateStatus}. Hooks: command.execute.before, event, tool.execute.after, experimental.chat.system.transform, experimental.chat.messages.transform.`)
 
   return {
     "command.execute.before": async (input, output) => {
@@ -906,42 +983,38 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
       if (!args || args === "status") {
         const goal = goalStates.get(sessionID)
         const lastResult = lastGoalResults.get(sessionID)
-        output.parts = [
-          makeTextPart(
-            goal
-              ? formatStatus(goal)
-              : lastResult
-                ? formatGoalResult(lastResult)
-                : "No active goal. Set one with `/goal <condition>`.",
-          ),
-        ]
+        const text = goal
+          ? formatStatus(goal)
+          : lastResult
+            ? formatGoalResult(lastResult)
+            : "No active goal. Set one with `/goal <condition>`."
+        commandResponseTexts.add(text)
+        output.parts = [makeTextPart(text)]
         return
       }
 
       if (args === "history") {
         const goal = goalStates.get(sessionID)
         const lastResult = lastGoalResults.get(sessionID)
-        output.parts = [
-          makeTextPart(
-            goal
-              ? [
-                  `Goal history for: ${goal.condition}`,
-                  "",
-                  `Latest checkpoint: ${goal.lastCheckpoint?.summary || "none yet"}`,
-                  "",
-                  formatHistory(goal.history),
-                ].join("\n")
-              : lastResult
-                ? [
-                    `Last goal history for: ${lastResult.condition}`,
-                    "",
-                    `Latest checkpoint: ${lastResult.lastCheckpoint?.summary || "none recorded"}`,
-                    "",
-                    formatHistory(lastResult.history),
-                  ].join("\n")
-                : "No goal history recorded yet. Set a goal with `/goal <condition>`.",
-          ),
-        ]
+        const text = goal
+          ? [
+              `Goal history for: ${goal.condition}`,
+              "",
+              `Latest checkpoint: ${goal.lastCheckpoint?.summary || "none yet"}`,
+              "",
+              formatHistory(goal.history),
+            ].join("\n")
+          : lastResult
+            ? [
+                `Last goal history for: ${lastResult.condition}`,
+                "",
+                `Latest checkpoint: ${lastResult.lastCheckpoint?.summary || "none recorded"}`,
+                "",
+                formatHistory(lastResult.history),
+              ].join("\n")
+            : "No goal history recorded yet. Set a goal with `/goal <condition>`."
+        commandResponseTexts.add(text)
+        output.parts = [makeTextPart(text)]
         return
       }
 
@@ -949,14 +1022,18 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
         cleanupGoal(sessionID)
         lastGoalResults.delete(sessionID)
         await persist()
-        output.parts = [makeTextPart("Goal cleared.")]
+        const text = "Goal cleared."
+        commandResponseTexts.add(text)
+        output.parts = [makeTextPart(text)]
         return
       }
 
       if (PAUSE_COMMANDS.has(args)) {
         const goal = goalStates.get(sessionID)
         if (!goal) {
-          output.parts = [makeTextPart("No active goal. Set one with `/goal <condition>`.")]
+          const text = "No active goal. Set one with `/goal <condition>`."
+          commandResponseTexts.add(text)
+          output.parts = [makeTextPart(text)]
           return
         }
         goal.stopped = true
@@ -964,18 +1041,24 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
         goal.lastStatus = "Goal paused."
         pushHistory(goal, "paused", "User paused the active goal.")
         await persist()
-        output.parts = [makeTextPart(`Goal paused: ${goal.condition}`)]
+        const pauseText = `Goal paused: ${goal.condition}`
+        commandResponseTexts.add(pauseText)
+        output.parts = [makeTextPart(pauseText)]
         return
       }
 
       if (args === "resume") {
         const goal = goalStates.get(sessionID)
         if (!goal) {
-          output.parts = [makeTextPart("No active goal. Set one with `/goal <condition>`.")]
+          const text = "No active goal. Set one with `/goal <condition>`."
+          commandResponseTexts.add(text)
+          output.parts = [makeTextPart(text)]
           return
         }
         if (!goal.stopped) {
-          output.parts = [makeTextPart("Goal is already running.")]
+          const text = "Goal is already running."
+          commandResponseTexts.add(text)
+          output.parts = [makeTextPart(text)]
           return
         }
 
@@ -986,17 +1069,23 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
         goal.lastStatus = "Goal resumed with a fresh local budget."
         pushHistory(goal, "resumed", "User resumed the goal with a fresh local budget window.")
         await persist()
-        output.parts = [makeTextPart(`Goal resumed with fresh limits: ${goal.condition}`)]
+        const resumeText = `Goal resumed with fresh limits: ${goal.condition}`
+        commandResponseTexts.add(resumeText)
+        output.parts = [makeTextPart(resumeText)]
         return
       }
 
       const parsed = parseGoalArguments(args, defaultGoalOptions)
       if (parsed.errors.length > 0) {
-        output.parts = [makeTextPart(formatArgumentErrors(parsed.errors))]
+        const text = formatArgumentErrors(parsed.errors)
+        commandResponseTexts.add(text)
+        output.parts = [makeTextPart(text)]
         return
       }
       if (!parsed.condition) {
-        output.parts = [makeTextPart("No goal provided. Set one with `/goal <condition>`.")]
+        const text = "No goal provided. Set one with `/goal <condition>`."
+        commandResponseTexts.add(text)
+        output.parts = [makeTextPart(text)]
         return
       }
 
@@ -1023,6 +1112,8 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
         history: [],
         checkpoints: [],
         lastCheckpoint: null,
+        trackedActions: [],
+        completionVerificationPrompted: false,
       }
 
       pushHistory(
@@ -1035,22 +1126,20 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
       lastGoalResults.delete(sessionID)
       goalStates.set(sessionID, goal)
       await persist()
-      output.parts = [
-        makeTextPart(
-          [
-            `New active goal: ${goal.condition}`,
-            "",
-            "Start working toward this goal now.",
-            "When the goal is fully satisfied, end your response with `[goal:complete]`.",
-            "If you are truly blocked and need the user, end with `[goal:blocked]`.",
-            "Use `/goal history` to inspect recent lifecycle events and checkpoints.",
-            "",
-            `Limits: ${goal.options.maxTurns} auto-continues, ${Math.round(
-              goal.options.maxDurationMs / 1000,
-            )}s, ${goal.options.maxTokens.toLocaleString()} tracked tokens.`,
-          ].join("\n"),
-        ),
-      ]
+      const newGoalText = [
+        `New active goal: ${goal.condition}`,
+        "",
+        "Start working toward this goal now.",
+        "When the goal is fully satisfied, end your response with `[goal:complete]`.",
+        "If you are truly blocked and need the user, end with `[goal:blocked]`.",
+        "Use `/goal history` to inspect recent lifecycle events and checkpoints.",
+        "",
+        `Limits: ${goal.options.maxTurns} auto-continues, ${Math.round(
+          goal.options.maxDurationMs / 1000,
+        )}s, ${goal.options.maxTokens.toLocaleString()} tracked tokens.`,
+      ].join("\n")
+      commandResponseTexts.add(newGoalText)
+      output.parts = [makeTextPart(newGoalText)]
     },
 
     event: async ({ event }) => {
@@ -1123,8 +1212,15 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
         activeGoalAfterMessages.lastAssistantMessageID = latestAssistantID
 
         if (goalIsComplete(latestText)) {
-          activeGoalAfterMessages.lastStatus = "Goal completed."
-          pushHistory(activeGoalAfterMessages, "completed", "Assistant marked the goal complete.")
+          const actions = activeGoalAfterMessages.trackedActions || []
+          activeGoalAfterMessages.lastStatus =
+            actions.length
+              ? `Goal completed. Evidence: ${actions.length} tracked tool action(s).`
+              : "Goal completed. (No tracked tool actions — may be answer-only or unverified.)"
+          pushHistory(activeGoalAfterMessages, "completed",
+            actions.length
+              ? `Assistant marked complete after ${actions.length} tracked tool action(s).`
+              : "Assistant marked complete without tracked tool actions.")
           rememberGoalResult(sessionID, activeGoalAfterMessages, "achieved")
           cleanupGoal(sessionID)
           await persist()
@@ -1285,35 +1381,111 @@ export const GoalPlugin = async ({ client }, pluginOptions = {}) => {
       }
     },
 
+    "tool.execute.after": async (input, output) => {
+      try {
+        const sessionID = input.sessionID
+        const goal = goalStates.get(sessionID)
+        if (!goal) return
+
+        const toolName = input.tool || "unknown"
+        const error = extractToolError(output)
+        const status = error ? "error" : "success"
+
+        goal.trackedActions = [
+          ...(goal.trackedActions || []),
+          {
+            toolName,
+            args: summarizeToolArgs(input.args),
+            timestamp: Date.now(),
+            status,
+            error,
+          },
+        ].slice(-MAX_TRACKED_ACTIONS)
+
+        await persist()
+      } catch (error) {
+        await logPluginError(client, "Failed to track goal tool action", error)
+      }
+    },
+
     "experimental.chat.system.transform": async (input, output) => {
-      if (!input.sessionID) return
+      try {
+        if (!input.sessionID) return
 
-      const goal = goalStates.get(input.sessionID)
-      if (!goal) return
-      if (goal.stopped) return
-      const systemBlocks = Array.isArray(output.system) ? [...output.system] : []
-      if (systemBlocks.some(systemBlockContainsGoal)) return
+        const goal = goalStates.get(input.sessionID)
+        if (!goal) return
+        if (goal.stopped) return
+        const systemBlocks = Array.isArray(output.system) ? [...output.system] : []
+        if (systemBlocks.some(systemBlockContainsGoal)) return
 
-      const goalBlock = [
-        buildGoalBlock(goal),
-        "Keep working until the goal is fully satisfied.",
-        "When fully satisfied, end the response with `[goal:complete]`.",
-        "If user input is required, explain the blocker in the line immediately before `[goal:blocked]`.",
-        buildLimitWarning(goal),
-      ].filter(Boolean).join("\n")
+        const goalBlock = [
+          buildGoalBlock(goal),
+          "Keep working until the goal is fully satisfied.",
+          "When fully satisfied, end the response with `[goal:complete]`.",
+          "If user input is required, explain the blocker in the line immediately before `[goal:blocked]`.",
+          buildLimitWarning(goal),
+        ].filter(Boolean).join("\n")
 
-      if (systemBlocks.length === 0) {
-        output.system = [goalBlock]
-        return
+        if (systemBlocks.length === 0) {
+          output.system = [goalBlock]
+          return
+        }
+
+        const mergedFirstBlock = appendGoalToSystemBlock(systemBlocks[0], goalBlock)
+        if (mergedFirstBlock) {
+          systemBlocks[0] = mergedFirstBlock
+        } else {
+          systemBlocks.unshift(goalBlock)
+        }
+        output.system = systemBlocks
+      } catch (error) {
+        await logPluginError(client, "Goal system.transform failed", error)
       }
+    },
 
-      const mergedFirstBlock = appendGoalToSystemBlock(systemBlocks[0], goalBlock)
-      if (mergedFirstBlock) {
-        systemBlocks[0] = mergedFirstBlock
-      } else {
-        systemBlocks.unshift(goalBlock)
+    "experimental.chat.messages.transform": async (_input, output) => {
+      try {
+        if (!Array.isArray(output.messages)) return
+
+        // Filter out command artifact echoes
+        output.messages = output.messages.filter((message) => {
+          const role = messageRole(message)
+          if (role !== "assistant") return true
+          const text = getText(message.parts || [])
+          if (!text.trim()) return true
+          if (commandResponseTexts.has(text)) return false
+          return true
+        })
+
+        // Derive sessionID from last message for fallback injection
+        const lastMsg = output.messages.at(-1)
+        const sessionID = messageSessionID(lastMsg)
+
+        // Fallback: inject goal context if system.transform didn't do it
+        if (sessionID && goalStates.has(sessionID)) {
+          const goal = goalStates.get(sessionID)
+          if (goal && !goal.stopped) {
+            const hasGoalInjection = output.messages.some(msg => {
+              const text = getText(msg.parts || [])
+              return text.includes("<goal_objective>")
+            })
+            if (!hasGoalInjection) {
+              const latestUser = [...output.messages].reverse().find(
+                msg => messageRole(msg) === "user",
+              )
+              if (latestUser) {
+                const goalBlock = buildGoalBlock(goal)
+                latestUser.parts = [
+                  ...(latestUser.parts || []),
+                  makeTextPart(`\n\n<goal_fallback_context>\n${goalBlock}\n\nKeep working until the goal is fully satisfied.\nWhen fully satisfied, end the response with [goal:complete].\nIf user input is required, explain the blocker before [goal:blocked].\n</goal_fallback_context>`),
+                ]
+              }
+            }
+          }
+        }
+      } catch (error) {
+        await logPluginError(client, "Goal messages.transform failed", error)
       }
-      output.system = systemBlocks
     },
   }
 }
@@ -1334,6 +1506,11 @@ export const testInternals = {
   extractBlockedReason,
   findLatestAssistantMessage,
   formatArgumentErrors,
+  formatTrackedActions,
+  normalizeTrackedAction,
+  normalizeTrackedActions,
+  summarizeToolArgs,
+  extractToolError,
   formatStatus,
   getSessionID,
   goalIsBlocked,
